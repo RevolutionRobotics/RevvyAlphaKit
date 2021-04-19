@@ -8,6 +8,7 @@ from typing import NamedTuple
 
 from revvy.utils.functions import retry
 from revvy.utils.stopwatch import Stopwatch
+from revvy.utils.logger import Logger, LogLevel
 
 crc7_table = (
     0x00, 0x09, 0x12, 0x1b, 0x24, 0x2d, 0x36, 0x3f,
@@ -73,14 +74,16 @@ class Command:
     def create(op, command, payload=b''):
         payload_length = len(payload)
         if payload_length > 255:
-            raise ValueError(f'Payload is too long ({payload_length} bytes, 255 allowed)')
+            raise ValueError(
+                f'Payload is too long ({payload_length} bytes, 255 allowed)')
 
         pl = bytearray(6 + payload_length)
 
         if payload:
             pl[6:] = payload
             payload_checksum = binascii.crc_hqx(pl[6:], 0xFFFF)
-            high_byte, low_byte = divmod(payload_checksum, 256)  # get bytes of unsigned short
+            # get bytes of unsigned short
+            high_byte, low_byte = divmod(payload_checksum, 256)
         else:
             high_byte = low_byte = 0xFF
 
@@ -144,7 +147,8 @@ class ResponseHeader(NamedTuple):
             if crc7(header_bytes) != data[4]:
                 raise ValueError('Header checksum mismatch')
 
-            status, _payload_length, _payload_checksum = struct.unpack('<BBH', header_bytes)
+            status, _payload_length, _payload_checksum = struct.unpack(
+                '<BBH', header_bytes)
             return ResponseHeader(status=ResponseStatus(status),
                                   payload_length=_payload_length,
                                   payload_checksum=_payload_checksum,
@@ -166,11 +170,15 @@ class Response(NamedTuple):
 
 class RevvyTransport:
     _mutex = Lock()  # we only have a single I2C interface
-    timeout = 5  # [seconds] how long the slave is allowed to respond with "busy"
+    # [seconds] how long the slave is allowed to respond with "busy"
+    timeout = 5
 
-    def __init__(self, transport: RevvyTransportInterface):
+    def __init__(self, transport: RevvyTransportInterface, logger: Logger):
         self._transport = transport
+        self._log = logger
         self._stopwatch = Stopwatch()
+        self._error_print_timeout = Stopwatch()
+        self._errors = 0
 
     def send_command(self, command, payload=b'') -> Response:
         """
@@ -223,9 +231,12 @@ class RevvyTransport:
         """
 
         def _read_response_header_once():
-            header_bytes = self._transport.read(5)
-
-            return ResponseHeader.create(header_bytes)
+            try:
+                header_bytes = self._transport.read(5)
+                return ResponseHeader.create(header_bytes)
+            except Exception as e:
+                self._errors += 1
+                raise e
 
         header = retry(_read_response_header_once, retries)
 
@@ -249,15 +260,24 @@ class RevvyTransport:
 
         def _read_payload_once():
             # read header and payload
-            response_bytes = self._transport.read(5 + header.payload_length)
-            response_header, response_payload = response_bytes[0:4], response_bytes[5:]  # skip checksum byte
+            try:
+                response_bytes = self._transport.read(
+                    5 + header.payload_length)
+            except Exception as e:
+                self._errors += 1
+                raise e
+
+            # skip checksum byte
+            response_header, response_payload = response_bytes[0:4], response_bytes[5:]
 
             # make sure we read the same response data we expect
             if not header.is_same_as(response_header):
+                self._errors += 1
                 raise ValueError('Read payload: Unexpected header received')
 
             # make sure data is intact
             if not header.validate_payload(response_payload):
+                self._errors += 1
                 raise ValueError('Read payload: payload contents invalid')
 
             return response_payload
@@ -279,8 +299,22 @@ class RevvyTransport:
         @param command: The command bytes to send
         @return: The response header
         """
-        self._transport.write(command)
+
+        if self._error_print_timeout.elapsed >= 1:
+            self._error_print_timeout.reset()
+            if self._errors > 0:
+                self._log.log(
+                    f'Errors in last second: {self._errors}', LogLevel.WARNING)
+                self._errors = 0
+
+        try:
+            self._transport.write(command)
+        except Exception as e:
+            self._errors += 1
+            raise e
+
         self._stopwatch.reset()
+
         while self._stopwatch.elapsed < self.timeout:
             response = self._read_response_header()
             if response.status != ResponseStatus.Busy:
